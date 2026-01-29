@@ -20,54 +20,62 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
         
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_POST, true);
+        
+        // 【修正ポイント】長大なキー (Foundry/Entra ID) に対応するため Bearer 認証を使用
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Ocp-Apim-Subscription-Key: ' . $ocr_key,
+            'Authorization: Bearer ' . $ocr_key,
             'Content-Type: application/octet-stream'
         ]);
+        
         curl_setopt($ch, CURLOPT_POSTFIELDS, $fileData);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HEADER, true);
+        curl_setopt($ch, CURLOPT_HEADER, true); // Locationヘッダー取得のため必要
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlError = curl_error($ch);
         $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
         $headers = substr($response, 0, $headerSize);
+        $resBody = substr($response, $headerSize);
         curl_close($ch);
 
-        if ($httpCode !== 202) {
-            $debug_info = "接続エラー (HTTP $httpCode)。詳細: $curlError";
-            continue;
-        }
+        // 202 Accepted が返ってくれば成功
+        if ($httpCode === 202) {
+            // Operation-Location ヘッダーから結果取得用URLを抽出
+            if (preg_match('/Operation-Location:\s*(.*)\r/i', $headers, $matches)) {
+                $resultUrl = trim($matches[1]);
 
-        // 解析 ID の取得
-        if (preg_match('/apim-request-id:\s*([\w-]+)/i', $headers, $matches)) {
-            $requestId = trim($matches[1]);
-            $resultUrl = $ocr_endpoint . "formrecognizer/documentModels/prebuilt-receipt/analyzeResults/" . $requestId . "?api-version=2023-07-31";
+                // 最大 15 回まで結果を待機（ポーリング）
+                for ($i = 0; $i < 15; $i++) {
+                    sleep(2);
+                    $ch_res = curl_init($resultUrl);
+                    curl_setopt($ch_res, CURLOPT_HTTPHEADER, [
+                        'Authorization: Bearer ' . $ocr_key // ここも Bearer 認証
+                    ]);
+                    curl_setopt($ch_res, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch_res, CURLOPT_SSL_VERIFYPEER, false);
+                    $finalResBody = curl_exec($ch_res);
+                    curl_close($ch_res);
 
-            // 最大 15 回まで結果を待機
-            for ($i = 0; $i < 15; $i++) {
-                sleep(2);
-                $ch = curl_init($resultUrl);
-                curl_setopt($ch, CURLOPT_HTTPHEADER, ['Ocp-Apim-Subscription-Key: ' . $ocr_key]);
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                $resBody = curl_exec($ch);
-                curl_close($ch);
-
-                $data = json_decode($resBody, true);
-                if (isset($data['status']) && $data['status'] === 'succeeded') {
-                    $doc = $data['analyzeResult']['documents'][0]['fields'] ?? [];
-                    $results[] = [
-                        'merchant' => $doc['MerchantName']['valueString'] ?? '店舗名不明',
-                        'date' => $doc['TransactionDate']['valueDate'] ?? '日付不明',
-                        'total' => $doc['Total']['valueCurrency']['amount'] ?? 0
-                    ];
-                    break;
+                    $data = json_decode($finalResBody, true);
+                    if (isset($data['status']) && $data['status'] === 'succeeded') {
+                        $doc = $data['analyzeResult']['documents'][0]['fields'] ?? [];
+                        $results[] = [
+                            'merchant' => $doc['MerchantName']['valueString'] ?? '店舗名不明',
+                            'date' => $doc['TransactionDate']['valueDate'] ?? '日付不明',
+                            'total' => $doc['Total']['valueCurrency']['amount'] ?? ($doc['Total']['valueNumber'] ?? 0)
+                        ];
+                        break;
+                    } elseif (isset($data['status']) && $data['status'] === 'failed') {
+                        $debug_info = "解析失敗 (Azure内部エラー)";
+                        break;
+                    }
                 }
             }
+        } else {
+            $errorDetail = json_decode($resBody, true);
+            $debug_info = "接続エラー (HTTP $httpCode)。詳細: " . ($errorDetail['error']['message'] ?? '不明なエラー');
         }
     }
 }
@@ -90,11 +98,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
     <?php if (empty($results)): ?>
         <div class="error-msg">
             <p><strong>解析に失敗しました。</strong></p>
-            <p>診断情報: <?php echo htmlspecialchars($debug_info ?: "Azure AI サービスからの応答がありません。設定を再確認してください。"); ?></p>
+            <p>診断情報: <?php echo htmlspecialchars($debug_info ?: "Azure からの応答がありません。"); ?></p>
             <hr>
             <p>【現在の設定確認】</p>
             <p>Endpoint: <?php echo htmlspecialchars($ocr_endpoint); ?></p>
-            <p>Key: <?php echo $ocr_key ? "設定済み" : "未設定"; ?></p>
+            <p>Key（先頭4文字）: <?php echo $ocr_key ? htmlspecialchars(substr($ocr_key, 0, 4)) . "..." : "未設定"; ?></p>
         </div>
     <?php else: ?>
         <p class="success-text">スキャンが完了しました！</p>
