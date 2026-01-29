@@ -1,9 +1,9 @@
 <?php
-// 1. 環境変数の取得と整理（トリミング）
+// 1. 環境変数の取得と整理
 $ocr_key = trim(getenv('OCR_KEY'));
 $ocr_endpoint = trim(getenv('OCR_ENDPOINT'));
 
-// エンドポイントの形式を正しく整形 (https://...com/)
+// エンドポイントの形式を正しく整形
 $ocr_endpoint = rtrim($ocr_endpoint, '/') . '/';
 
 $results = [];
@@ -15,21 +15,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
         
         $fileData = file_get_contents($tmp_name);
         
-        // 最新の API URL を構築
+        // API URL (2023-07-31 は安定版)
         $url = $ocr_endpoint . "formrecognizer/documentModels/prebuilt-receipt:analyze?api-version=2023-07-31";
         
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_POST, true);
         
-        // 【修正ポイント】長大なキー (Foundry/Entra ID) に対応するため Bearer 認証を使用
+        // 【ここが重要】32文字の短キー (7365...) の場合はこっちのヘッダーを使う
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Authorization: Bearer ' . $ocr_key,
+            'Ocp-Apim-Subscription-Key: ' . $ocr_key,
             'Content-Type: application/octet-stream'
         ]);
         
         curl_setopt($ch, CURLOPT_POSTFIELDS, $fileData);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HEADER, true); // Locationヘッダー取得のため必要
+        curl_setopt($ch, CURLOPT_HEADER, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         
@@ -37,21 +37,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
         $headers = substr($response, 0, $headerSize);
-        $resBody = substr($response, $headerSize);
+        $resBody = substr($response, $header_size);
         curl_close($ch);
 
-        // 202 Accepted が返ってくれば成功
         if ($httpCode === 202) {
-            // Operation-Location ヘッダーから結果取得用URLを抽出
+            // 解析IDまたはLocationを取得
             if (preg_match('/Operation-Location:\s*(.*)\r/i', $headers, $matches)) {
                 $resultUrl = trim($matches[1]);
 
-                // 最大 15 回まで結果を待機（ポーリング）
                 for ($i = 0; $i < 15; $i++) {
                     sleep(2);
                     $ch_res = curl_init($resultUrl);
                     curl_setopt($ch_res, CURLOPT_HTTPHEADER, [
-                        'Authorization: Bearer ' . $ocr_key // ここも Bearer 認証
+                        'Ocp-Apim-Subscription-Key: ' . $ocr_key // 短キー用
                     ]);
                     curl_setopt($ch_res, CURLOPT_RETURNTRANSFER, true);
                     curl_setopt($ch_res, CURLOPT_SSL_VERIFYPEER, false);
@@ -67,15 +65,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
                             'total' => $doc['Total']['valueCurrency']['amount'] ?? ($doc['Total']['valueNumber'] ?? 0)
                         ];
                         break;
-                    } elseif (isset($data['status']) && $data['status'] === 'failed') {
-                        $debug_info = "解析失敗 (Azure内部エラー)";
-                        break;
                     }
                 }
             }
         } else {
             $errorDetail = json_decode($resBody, true);
-            $debug_info = "接続エラー (HTTP $httpCode)。詳細: " . ($errorDetail['error']['message'] ?? '不明なエラー');
+            $debug_info = "HTTP $httpCode: " . ($errorDetail['error']['message'] ?? '認証エラー。キーが正しいか確認してください。');
         }
     }
 }
@@ -98,11 +93,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
     <?php if (empty($results)): ?>
         <div class="error-msg">
             <p><strong>解析に失敗しました。</strong></p>
-            <p>診断情報: <?php echo htmlspecialchars($debug_info ?: "Azure からの応答がありません。"); ?></p>
+            <p>診断情報: <?php echo htmlspecialchars($debug_info); ?></p>
             <hr>
-            <p>【現在の設定確認】</p>
+            <p>【現在の設定】</p>
             <p>Endpoint: <?php echo htmlspecialchars($ocr_endpoint); ?></p>
-            <p>Key（先頭4文字）: <?php echo $ocr_key ? htmlspecialchars(substr($ocr_key, 0, 4)) . "..." : "未設定"; ?></p>
+            <p>Key（先頭4文字）: <?php echo htmlspecialchars(substr($ocr_key, 0, 4)); ?>...</p>
         </div>
     <?php else: ?>
         <p class="success-text">スキャンが完了しました！</p>
@@ -114,7 +109,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
             </div>
         <?php endforeach; ?>
     <?php endif; ?>
-    
     <br><a href="index.php">← 戻る</a>
 </body>
 </html>
