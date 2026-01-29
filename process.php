@@ -1,5 +1,5 @@
 <?php
-// 1. 获取环境变量
+// 1. 環境変数の取得
 $ocr_key = getenv('OCR_KEY');
 $ocr_endpoint = getenv('OCR_ENDPOINT');
 $ocr_endpoint = rtrim($ocr_endpoint, '/') . '/';
@@ -12,26 +12,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
         if (empty($tmp_name)) continue;
         $fileData = file_get_contents($tmp_name);
 
-        // 拼接 API 地址
+        // APIのエンドポイント設定
         $url = $ocr_endpoint . "formrecognizer/documentModels/prebuilt-receipt:analyze?api-version=2023-07-31";
         
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/octet-stream',
-            'Ocp-Apim-Subscription-Key: ' . $ocr_key
+            'Ocp-Apim-Subscription-Key: ' . $ocr_key,
+            'Content-Type: application/octet-stream'
         ]);
         curl_setopt($ch, CURLOPT_POSTFIELDS, $fileData);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_HEADER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // SSL接続エラー対策
+        
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
         $headers = substr($response, 0, $headerSize);
+        $curlError = curl_error($ch);
         curl_close($ch);
 
         if ($httpCode !== 202) {
-            $debug_info = "API连接失败。HTTP代码: " . $httpCode . " (如果是401说明Key错了, 404说明Endpoint错了)";
+            $debug_info = "接続失敗。HTTPコード: " . $httpCode . " 詳細: " . $curlError;
             continue;
         }
 
@@ -39,12 +42,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
             $requestId = trim($matches[1]);
             $resultUrl = $ocr_endpoint . "formrecognizer/documentModels/prebuilt-receipt/analyzeResults/" . $requestId . "?api-version=2023-07-31";
 
-            // 轮询结果
+            // 解析結果の取得待ち
             for ($i = 0; $i < 10; $i++) {
                 sleep(2);
                 $ch = curl_init($resultUrl);
                 curl_setopt($ch, CURLOPT_HTTPHEADER, ['Ocp-Apim-Subscription-Key: ' . $ocr_key]);
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 $resBody = curl_exec($ch);
                 curl_close($ch);
 
@@ -67,32 +71,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['receipts'])) {
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>スキャン結果</title>
+    <title>レシート解析結果</title>
     <style>
         body { font-family: sans-serif; padding: 20px; background: #f0f2f5; }
-        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-left: 5px solid #00a82d; margin-bottom: 10px; }
-        .error-box { background: #fab1a0; padding: 15px; border-radius: 8px; color: #c0392b; }
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-left: 5px solid #00a82d; margin-bottom: 15px; }
+        .error-msg { background: #fab1a0; padding: 20px; border-radius: 10px; color: #c0392b; }
+        .total-price { color: #d63031; font-weight: bold; font-size: 1.2em; }
     </style>
 </head>
 <body>
-    <h2>🏪 スキャン結果</h2>
+    <h2>🏪 レシート解析結果</h2>
+    
     <?php if (empty($results)): ?>
-        <div class="error-box">
+        <div class="error-msg">
             <p><strong>解析に失敗しました。</strong></p>
-            <p>診断情報: <?php echo $debug_info ?: "AIからの応答がありません。画像が不鮮明か、Keyの設定を確認してください。"; ?></p>
+            <p>エラー診断: <?php echo htmlspecialchars($debug_info ?: "Azure AI サービスに接続できません。"); ?></p>
             <hr>
-            <p>現在の設定 (確認用):</p>
+            <p>設定確認用:</p>
             <p>Endpoint: <?php echo htmlspecialchars($ocr_endpoint); ?></p>
         </div>
     <?php else: ?>
         <?php foreach ($results as $res): ?>
             <div class="card">
-                <p><strong>店舗:</strong> <?php echo htmlspecialchars($res['merchant']); ?></p>
-                <p><strong>日付:</strong> <?php echo htmlspecialchars($res['date']); ?></p>
-                <p style="color:red; font-size:1.2em;"><strong>合計:</strong> ¥<?php echo number_format($res['total']); ?></p>
+                <p><strong>店舗名:</strong> <?php echo htmlspecialchars($res['merchant']); ?></p>
+                <p><strong>利用日:</strong> <?php echo htmlspecialchars($res['date']); ?></p>
+                <p class="total-price"><strong>合計金額:</strong> ¥<?php echo number_format($res['total']); ?></p>
             </div>
         <?php endforeach; ?>
     <?php endif; ?>
-    <br><a href="index.php">← 戻る</a>
+    
+    <br>
+    <a href="index.php">← 戻る</a>
 </body>
 </html>
