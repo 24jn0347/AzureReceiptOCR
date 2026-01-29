@@ -1,138 +1,98 @@
 <?php
-require 'config.php';
+// 1. 获取 Azure 钥匙
+$ocr_key = getenv('OCR_KEY');
+$ocr_endpoint = getenv('OCR_ENDPOINT');
+$ocr_endpoint = rtrim($ocr_endpoint, '/') . '/';
 
-// 创建文件夹（如果不存在）
+// 2. 准备文件夹
+$upload_dir = 'uploads/';
 if (!file_exists($upload_dir)) mkdir($upload_dir, 0777, true);
-if (!file_exists($csv_dir)) mkdir($csv_dir, 0777, true);
-if (!file_exists(dirname($log_file))) mkdir(dirname($log_file), 0777, true);
-if (!file_exists($log_file)) file_put_contents($log_file, "");
 
-// 连接数据库
-$conn = new mysqli($db_host, $db_user, $db_pass, $db_name);
-if ($conn->connect_error) die("数据库连接失败: " . $conn->connect_error);
+$results = [];
 
-$results = []; // 保存每张图片结果
-
+// 3. 处理上传的小票
 foreach ($_FILES['receipts']['tmp_name'] as $key => $tmp_name) {
+    if (empty($tmp_name)) continue;
+
     $original_name = $_FILES['receipts']['name'][$key];
     $filename = time() . '_' . $original_name;
     $filepath = $upload_dir . $filename;
     move_uploaded_file($tmp_name, $filepath);
 
-    // ---------- 调用 Azure OCR ----------
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $ocr_endpoint . "vision/v3.2/read/analyze");
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        "Ocp-Apim-Subscription-Key: $ocr_key",
-        "Content-Type: application/octet-stream"
-    ]);
+    // 调用最新的 Azure Receipt 识别接口
+    $url = $ocr_endpoint . "formrecognizer/documentModels/prebuilt-receipt:analyze?api-version=2023-07-31";
+    
+    $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/octet-stream',
+        'Ocp-Apim-Subscription-Key: ' . $ocr_key
+    ]);
     curl_setopt($ch, CURLOPT_POSTFIELDS, file_get_contents($filepath));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HEADER, true);
+
     $response = curl_exec($ch);
-    $status_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $headers = substr($response, 0, $headerSize);
     curl_close($ch);
 
-    if ($status_code != 202) {
-        $results[] = [
-            'filename' => $filename,
-            'items' => ['OCR失败'],
-            'total' => 0
-        ];
-        continue;
-    }
+    // 获取结果地址
+    if (preg_match('/apim-request-id:\s*([\w-]+)/i', $headers, $matches)) {
+        $requestId = trim($matches[1]);
+        $resultUrl = $ocr_endpoint . "formrecognizer/documentModels/prebuilt-receipt/analyzeResults/" . $requestId . "?api-version=2023-07-31";
 
-    // 获取 OCR 结果 URL
-    $response_data = json_decode($response, true);
-    $operation_location = $response_data['operation-location'] ?? '';
-    if (!$operation_location) continue;
+        // 轮询等待 AI 结果
+        for ($i = 0; $i < 10; $i++) {
+            sleep(1);
+            $ch = curl_init($resultUrl);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Ocp-Apim-Subscription-Key: ' . $ocr_key]);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            $resBody = curl_exec($ch);
+            curl_close($ch);
 
-    // 等待 OCR 处理完成
-    $ocr_text_lines = [];
-    for ($i = 0; $i < 20; $i++) { // 最多轮询20次
-        sleep(1);
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $operation_location);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            "Ocp-Apim-Subscription-Key: $ocr_key"
-        ]);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        $result_json = curl_exec($ch);
-        curl_close($ch);
-
-        // 写日志
-        file_put_contents($log_file, "[".date('Y-m-d H:i:s')."] $filename\n$result_json\n", FILE_APPEND);
-
-        $result_data = json_decode($result_json, true);
-        if (isset($result_data['status']) && $result_data['status'] == 'succeeded') {
-            foreach ($result_data['analyzeResult']['readResults'] as $page) {
-                foreach ($page['lines'] as $line) {
-                    $ocr_text_lines[] = $line['text'];
-                }
+            $data = json_decode($resBody, true);
+            if (isset($data['status']) && $data['status'] === 'succeeded') {
+                $doc = $data['analyzeResult']['documents'][0]['fields'] ?? [];
+                $results[] = [
+                    'filename' => $original_name,
+                    'merchant' => $doc['MerchantName']['valueString'] ?? '未知店铺',
+                    'date' => $doc['TransactionDate']['valueDate'] ?? '未知日期',
+                    'total' => $doc['Total']['valueCurrency']['amount'] ?? 0
+                ];
+                break;
             }
-            break;
         }
     }
-
-    // ---------- 解析 FamilyMart 收据 ----------
-    $items = [];
-    $total = 0;
-    foreach ($ocr_text_lines as $line) {
-        $line = str_replace(['軽','※'], '', $line); // 去掉多余字符
-
-        // 商品和价格
-        if (preg_match('/(.+?)\s*¥?(\d+)/u', $line, $matches)) {
-            $items[] = trim($matches[1]) . ' ¥' . $matches[2];
-        }
-
-        // 合计
-        if (strpos($line, '合計') !== false) {
-            if (preg_match('/¥?(\d+)/u', $line, $m)) $total = $m[1];
-        }
-    }
-
-    // 写入数据库
-    $stmt = $conn->prepare("INSERT INTO receipts (filename, items, total) VALUES (?, ?, ?)");
-    $stmt->bind_param("ssi", $filename, implode(", ", $items), $total);
-    $stmt->execute();
-    $stmt->close();
-
-    $results[] = [
-        'filename' => $filename,
-        'items' => $items,
-        'total' => $total
-    ];
 }
-
-// ---------- 生成统一 CSV ----------
-$csv_file = $csv_dir . "receipts_all_" . date('Ymd_His') . ".csv";
-$fp = fopen($csv_file, 'w');
-fputcsv($fp, ['filename', 'items', 'total']);
-foreach ($results as $res) {
-    fputcsv($fp, [$res['filename'], implode(", ", $res['items']), $res['total']]);
-}
-fclose($fp);
-
-$conn->close();
 ?>
 
 <!DOCTYPE html>
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>レシートOCR 結果</title>
+    <title>识别结果</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #f9f9f9; }
+        .card { background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .total { color: #e74c3c; font-size: 1.2em; font-weight: bold; }
+    </style>
 </head>
 <body>
-<h2>OCR結果</h2>
-
-<?php foreach ($results as $res): ?>
-    <h3><?php echo htmlspecialchars($res['filename']); ?></h3>
-    <p>商品: <?php echo htmlspecialchars(implode(", ", $res['items'])); ?></p>
-    <p>合計: ¥<?php echo htmlspecialchars($res['total']); ?></p>
-<?php endforeach; ?>
-
-<p><a href="<?php echo htmlspecialchars($csv_file); ?>" download>CSVをダウンロード</a></p>
-<p><a href="logs/ocr.log" download>OCRログをダウンロード</a></p>
-<p><a href="index.php">戻る</a></p>
+    <h2>🏪 扫描结果</h2>
+    <?php if (empty($results)): ?>
+        <p>未能识别，请检查 Key 和 Endpoint 是否正确。</p>
+    <?php else: ?>
+        <?php foreach ($results as $res): ?>
+            <div class="card">
+                <p><strong>文件：</strong><?php echo $res['filename']; ?></p>
+                <p><strong>店名：</strong><?php echo $res['merchant']; ?></p>
+                <p><strong>日期：</strong><?php echo $res['date']; ?></p>
+                <p class="total"><strong>金额：</strong>¥<?php echo number_format($res['total']); ?></p>
+            </div>
+        <?php endforeach; ?>
+    <?php endif; ?>
+    <br>
+    <a href="index.php">← 返回继续上传</a>
 </body>
 </html>
